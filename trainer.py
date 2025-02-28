@@ -28,7 +28,7 @@ def parse_args():
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     
     parser.add_argument('--project', default='results', help='결과 저장 디렉토리')
-    parser.add_argument('--name', default='YOLOv11-PascalVOC', help='실험 이름')
+    parser.add_argument('--name', default='YOLOv11-PascalVOC-v2', help='실험 이름')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='가장 최근 학습을 이어서 진행')
     
     parser.add_argument('--lr', type=float, default=0.01, help='학습률')
@@ -41,7 +41,9 @@ def parse_args():
     return parser.parse_args()
 
 def disable_yolo_mlflow():
-    """YOLO의 MLflow 기능 비활성화 시도 (설정 파일 직접 수정)"""
+    """
+    YOLO의 MLflow 기능 비활성화 시도 (설정 파일 직접 수정)
+    """
     try:
         config_file = os.path.expanduser("~/.config/Ultralytics/settings.json")
         if os.path.exists(config_file):
@@ -62,8 +64,10 @@ def disable_yolo_mlflow():
     except Exception as e:
         print(f"YOLO 설정 변경 중 오류 발생: {e}")
 
-def objective(trial, args, data_dict):
-    """Optuna 최적화를 위한 목적 함수"""
+def objective(trial, args, best_model_info=None):
+    """
+    Optuna 최적화를 위한 목적 함수
+    """
     
     # 실험 시작 시간
     start_time = time.time()
@@ -101,7 +105,7 @@ def objective(trial, args, data_dict):
     save_dir.mkdir(parents=True, exist_ok=True)
     
     # YOLOv11 nano 모델 로드
-    model = YOLO('yolo11n.pt')  # 상대 경로 사용
+    model = YOLO('yolo11n.pt')
     
     # 학습 설정 - 유효한 인자만 사용
     train_args = {
@@ -181,6 +185,99 @@ def objective(trial, args, data_dict):
             best_model_path = save_dir / 'weights' / 'best.pt'
             if best_model_path.exists():
                 mlflow.log_artifact(str(best_model_path))
+                
+                # 현재 모델이 지금까지 발견된 최고의 모델인지 확인
+                current_map = metrics['mAP50-95']
+                
+                # 이 모델의 메타데이터 생성
+                model_info = {
+                    'model_type': 'YOLOv11-nano',
+                    'dataset': args.data,
+                    'img_size': args.img_size,
+                    'search_method': args.search_method,
+                    'trial_number': trial.number,
+                    'mAP50': metrics['mAP50'],
+                    'mAP50-95': current_map,
+                    'precision': metrics['precision'],
+                    'recall': metrics['recall'],
+                    'fitness': metrics['fitness'],
+                    'training_time': training_time,
+                    'lr': lr,
+                    'batch_size': batch_size,
+                    'momentum': momentum,
+                    'weight_decay': weight_decay,
+                    'warmup_epochs': warmup_epochs,
+                    'run_id': run.info.run_id,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
+                # 현재 최고 성능 모델보다 좋은 성능을 보일 경우 정보 업데이트
+                if best_model_info is None or current_map > best_model_info['map_metric']:
+                    # MLflow에 모델 저장
+                    # PyTorch 모델을 MLflow에 저장 (모델 등록에 사용됨)
+                    mlflow.pytorch.log_model(
+                        pytorch_model=model.model,  # YOLOv11 내부 PyTorch 모델
+                        artifact_path="yolov11_model",
+                        registered_model_name=f"YOLOv11_{args.name}_{args.search_method}_best",
+                        metadata=model_info
+                    )
+                    
+                    # YOLO 모델 형식으로 별도 저장
+                    from urllib.parse import urlparse
+
+                    # MLflow 아티팩트 URI에서 파일 경로 추출
+                    artifact_uri = mlflow.get_artifact_uri()
+                    if artifact_uri.startswith('file:'):
+                        artifact_path = urlparse(artifact_uri).path  # URI에서 파일 경로 부분만 추출
+                    else:
+                        artifact_path = artifact_uri  # 다른 형태의 URI인 경우 처리 필요
+
+                    # YOLO 모델 저장 경로 설정
+                    yolo_model_dir = os.path.join(artifact_path, "yolo_model")
+                    os.makedirs(yolo_model_dir, exist_ok=True)
+                    model_save_path = os.path.join(yolo_model_dir, "best.pt")
+
+                    # 모델 저장
+                    model.save(model_save_path)
+                    mlflow.log_artifact(model_save_path, "yolo_model")
+                    
+
+                    
+                    # 모델 내보내기
+                    print(colorstr('bold', 'green', '모델 내보내기...'))
+                    export_formats = ['onnx', 'torchscript']
+                    for export_format in export_formats:
+                        try:
+                            export_path = model.export(format=export_format, imgsz=args.img_size)
+                            mlflow.log_artifact(str(export_path))
+                        except Exception as e:
+                            print(f"모델 내보내기 실패 ({export_format}): {e}")
+                    
+                    # 최고 성능 모델 정보 업데이트
+                    best_model_info = {
+                        'trial_number': trial.number,
+                        'params': {
+                            'lr': lr,
+                            'batch_size': batch_size,
+                            'momentum': momentum,
+                            'weight_decay': weight_decay,
+                            'warmup_epochs': warmup_epochs
+                        },
+                        'metrics': metrics,
+                        'map_metric': current_map,
+                        'model_path': str(best_model_path),
+                        'run_id': run.info.run_id,
+                        'training_time': training_time
+                    }
+                    
+                    # 최고 성능 모델 정보 파일 저장
+                    best_model_info_path = Path(args.project) / f"{args.name}_{args.search_method}_best_model_info.json"
+                    with open(best_model_info_path, 'w') as f:
+                        json.dump(best_model_info, f, indent=2)
+                    
+                    print(f"\n{colorstr('bold', 'blue', '새로운 최고 성능 모델 발견!')}")
+                    print(f"Trial: {trial.number}, mAP50-95: {current_map:.4f}")
+                    print(f"최고 성능 모델 정보가 저장되었습니다: {best_model_info_path}\n")
             
             # 최적화 목표 반환 (mAP50-95 사용)
             map_metric = metrics['mAP50-95']
@@ -190,18 +287,18 @@ def objective(trial, args, data_dict):
             print(f"Trial {trial.number} 중 오류 발생: {e}")
             # 실패한 경우 낮은 점수 반환
     
-    return map_metric
+    return map_metric, best_model_info
 
 def run_optimization(args):
-    """Optuna를 사용한 하이퍼파라미터 최적화 실행"""
+    """
+    Optuna를 사용한 하이퍼파라미터 최적화 실행
+    """
     # MLflow 설정 - 독립적인 디렉토리 사용
     mlflow.set_tracking_uri(f"file://{os.path.abspath('optuna_mlruns')}")
     mlflow.set_experiment(f"{args.name}")
     
     # 디렉토리 생성
     os.makedirs("optuna_mlruns", exist_ok=True)
-    
-    # 내장 VOC 데이터셋을 사용하므로 YAML 파일 생성 부분은 제외
     
     # 데이터셋 설정
     data_dict = check_det_dataset(args.data)
@@ -240,6 +337,16 @@ def run_optimization(args):
             print(f"경고: 지정된 실험 횟수({args.n_trials})가 전체 Grid 탐색 공간({total_grid_points})보다 작습니다.")
             print(f"일부 조합만 탐색될 수 있습니다. 필요시 --n_trials 값을 늘려주세요.")
     
+    # 최고 성능 모델 정보를 저장할 변수
+    best_model_info = None
+    
+    # trial마다 최고의 모델을 추적하는 콜백 함수 정의
+    def objective_wrapper(trial):
+        nonlocal best_model_info
+        map_metric, updated_best_model_info = objective(trial, args, best_model_info)
+        best_model_info = updated_best_model_info  # 최고 성능 모델 정보 업데이트
+        return map_metric
+    
     # Optuna 최적화 시작
     print(colorstr('bold', 'green', f'Optuna 최적화 시작 - {args.n_trials} 실험 예정...'))
     study = optuna.create_study(
@@ -248,18 +355,14 @@ def run_optimization(args):
         sampler=sampler
     )
     
-    # 저장된 최적 결과를 담을 변수
-    best_params = None
-    best_value = 0.0
-    
     try:
         study.optimize(
-            lambda trial: objective(trial, args, data_dict),
+            objective_wrapper,
             n_trials=args.n_trials,
             catch=(Exception,)
         )
         
-        # 최적의 하이퍼파라미터와 결과 출력
+        # 최적화 결과 출력
         print("\n" + "="*80)
         print(colorstr('bold', 'green', '최적화 완료!'))
         print(f"최적 파라미터: {study.best_params}")
@@ -267,8 +370,17 @@ def run_optimization(args):
         print(f"탐색 방법: {args.search_method}")
         print("="*80 + "\n")
         
-        best_params = study.best_params
-        best_value = study.best_value
+        # 최고 성능 모델 정보 파일 경로
+        best_model_info_path = Path(args.project) / f"{args.name}_{args.search_method}_best_model_info.json"
+        
+        if best_model_info and os.path.exists(best_model_info_path):
+            print(colorstr('bold', 'green', f'최고 성능 모델 정보:'))
+            print(f"Trial 번호: {best_model_info['trial_number']}")
+            print(f"mAP50-95: {best_model_info['map_metric']:.4f}")
+            print(f"하이퍼파라미터: {best_model_info['params']}")
+            print(f"최고 성능 모델 경로: {best_model_info['model_path']}")
+            print(f"MLflow Run ID: {best_model_info['run_id']}")
+            print(f"전체 정보: {best_model_info_path}")
         
         # 최적화 결과 저장
         result_file = Path(args.project) / f"{args.name}_{args.search_method}_optuna_results.json"
@@ -280,222 +392,14 @@ def run_optimization(args):
                 'search_method': args.search_method,
                 'direction': 'maximize',
                 'n_trials': args.n_trials,
+                'best_trial_number': best_model_info['trial_number'] if best_model_info else None,
+                'best_model_run_id': best_model_info['run_id'] if best_model_info else None,
                 'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             }, f, indent=2)
         print(f"최적화 결과가 저장되었습니다: {result_file}")
         
     except Exception as e:
         print(f"최적화 중 오류 발생: {e}")
-    
-    # 최적의 모델로 최종 학습 및 평가 (최적값이 있는 경우)
-    if best_params:
-        run_final_training(args, best_params)
-    else:
-        print("최적화에 실패했습니다. 기본 파라미터로 학습을 진행합니다.")
-        run_final_training(args)
-
-def run_final_training(args, best_params=None):
-    """최적 파라미터 또는 기본 파라미터로 최종 학습 및 평가 실행"""
-    # MLflow 설정 - 독립적인 디렉토리 사용
-    mlflow.set_tracking_uri(f"file://{os.path.abspath('final_mlruns')}")
-    mlflow.set_experiment(f"YOLOv11-Final-{args.name}")
-    
-    # 디렉토리 생성
-    os.makedirs("final_mlruns", exist_ok=True)
-    
-    # MLflow 실험 시작
-    run_name = f"final_{args.search_method}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    
-    # 내장 VOC 데이터셋을 사용하므로 YAML 파일 생성 부분은 제외
-    
-    # 결과 저장 경로 생성
-    save_dir = Path(args.project) / f"{args.name}_{args.search_method}"
-    save_dir.mkdir(parents=True, exist_ok=True)
-    
-    # YOLOv11 nano 모델 로드
-    model = YOLO('yolo11n.pt')  # 상대 경로 사용
-    
-    # 데이터셋 설정
-    data_dict = check_det_dataset(args.data)
-    print(f"데이터셋 정보: {data_dict}")
-    
-    # 학습 설정 - 최적 파라미터 적용
-    if best_params:
-        print(colorstr('bold', 'green', f'최적 하이퍼파라미터로 최종 학습 시작... (탐색 방법: {args.search_method})'))
-        train_args = {
-            'data': args.data,
-            'imgsz': args.img_size,
-            'epochs': args.epochs,
-            'batch': best_params.get('batch_size', args.batch_size),
-            'workers': args.workers,
-            'device': args.device,
-            'project': args.project,
-            'name': f"{args.name}_{args.search_method}",
-            'resume': args.resume,
-            'lr0': best_params.get('lr', args.lr),
-            'lrf': 0.01,
-            'momentum': best_params.get('momentum', 0.937),
-            'weight_decay': best_params.get('weight_decay', 0.0005),
-            'warmup_epochs': best_params.get('warmup_epochs', 3.0),
-            'warmup_momentum': 0.8,
-            'warmup_bias_lr': 0.1,
-            'optimizer': 'AdamW',
-            'patience': 50,
-            'save': True,
-            'save_period': -1,
-            'plots': True,
-            'rect': False,
-            'cos_lr': True,
-        }
-    else:
-        print(colorstr('bold', 'green', f'기본 파라미터로 학습 시작... (탐색 방법: {args.search_method})'))
-        train_args = {
-            'data': args.data,
-            'imgsz': args.img_size,
-            'epochs': args.epochs,
-            'batch': args.batch_size,
-            'workers': args.workers,
-            'device': args.device,
-            'project': args.project,
-            'name': f"{args.name}_{args.search_method}",
-            'resume': args.resume,
-            'lr0': args.lr,
-            'lrf': 0.01,
-            'momentum': 0.937,
-            'weight_decay': 0.0005,
-            'warmup_epochs': 3.0,
-            'warmup_momentum': 0.8,
-            'warmup_bias_lr': 0.1,
-            'optimizer': 'AdamW',
-            'patience': 50,
-            'save': True,
-            'save_period': -1,
-            'plots': True,
-            'rect': False,
-            'cos_lr': True,
-        }
-    
-    # 학습 시작 시간
-    start_time = time.time()
-    
-    # with 문으로 MLflow 실험 세션 관리
-    with mlflow.start_run(run_name=run_name) as run:
-        try:
-            # MLflow에 태그 설정 - 검색 방법론 및 실험 유형 추적을 위해
-            mlflow.set_tag("search_method", args.search_method)
-            mlflow.set_tag("run_type", "final_training")
-            mlflow.set_tag("optimized", "True" if best_params else "False")
-            
-            # MLflow에 파라미터 기록
-            for key, value in train_args.items():
-                mlflow.log_param(key, value)
-                
-            # 학습 실행
-            results = model.train(**train_args)
-            
-            # 학습 후 결과를 수집하기 위해 모델 상태 확인 (필요한 경우)
-            if hasattr(results, 'results'):
-                for epoch, result in enumerate(results.results):
-                    if isinstance(result, dict):
-                        for k, v in result.items():
-                            if isinstance(v, (int, float)):
-                                mlflow.log_metric(f"epoch_{k}", v, step=epoch)
-                                
-            # 검증 실행
-            print(colorstr('bold', 'green', '검증 시작...'))
-            val_results = model.val(data=args.data, batch=train_args['batch'], imgsz=args.img_size)
-            print(f"검증 결과: {val_results}")
-            
-            # 주요 메트릭 추출 및 MLflow에 기록
-            metrics = {
-                'mAP50': float(val_results.box.map50),
-                'mAP50-95': float(val_results.box.map),
-                'precision': float(val_results.box.mp),
-                'recall': float(val_results.box.mr),
-                'fitness': float(val_results.fitness),
-                'training_time': time.time() - start_time
-            }
-            
-            for key, value in metrics.items():
-                mlflow.log_metric(key, value)
-            
-            # 테스트 데이터로 추론 수행
-            print(colorstr('bold', 'green', '테스트 시작...'))
-            test_results = model.predict(
-                source=data_dict['test'],
-                save=True,
-                save_txt=True,
-                save_conf=True,
-                project=args.project,
-                name=f"{args.name}_{args.search_method}_test"
-            )
-            print(f"테스트 완료: 결과가 {os.path.join(args.project, f'{args.name}_{args.search_method}_test')}에 저장되었습니다.")
-            
-            # 모델 내보내기
-            print(colorstr('bold', 'green', '모델 내보내기...'))
-            export_formats = ['onnx', 'torchscript']
-            for export_format in export_formats:
-                try:
-                    export_path = model.export(format=export_format, imgsz=args.img_size)
-                    mlflow.log_artifact(str(export_path))
-                except Exception as e:
-                    print(f"모델 내보내기 실패 ({export_format}): {e}")
-            
-            # 최종 모델 경로
-            best_model_path = save_dir / 'weights' / 'best.pt'
-            if best_model_path.exists():
-                # 기존 log_artifact 방식
-                mlflow.log_artifact(str(best_model_path))
-                
-                # 새로운 코드: MLflow에 모델 등록 및 저장
-                print(colorstr('bold', 'green', 'MLflow에 최종 모델 저장 중...'))
-                
-                # 모델 메타데이터 설정
-                model_info = {
-                    'model_type': 'YOLOv11-nano',
-                    'dataset': args.data,
-                    'img_size': args.img_size,
-                    'search_method': args.search_method,
-                    'best_mAP50': metrics['mAP50'],
-                    'best_mAP50-95': metrics['mAP50-95'],
-                    'precision': metrics['precision'],
-                    'recall': metrics['recall'],
-                    'training_time': metrics['training_time'],
-                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                }
-                
-                # 하이퍼파라미터 정보 추가
-                if best_params:
-                    model_info.update({
-                        'optimized': True,
-                        'best_lr': best_params.get('lr'),
-                        'best_batch_size': best_params.get('batch_size'),
-                        'best_momentum': best_params.get('momentum'),
-                        'best_weight_decay': best_params.get('weight_decay'),
-                        'best_warmup_epochs': best_params.get('warmup_epochs')
-                    })
-                    
-                # MLflow에 피클 모델 저장 (파이토치 모델 형식으로)
-                mlflow.pytorch.log_model(
-                    pytorch_model=model.model,  # YOLOv11 내부 PyTorch 모델
-                    artifact_path="yolov11_model",
-                    registered_model_name=f"YOLOv11_{args.name}_{args.search_method}",
-                    metadata=model_info
-                )
-                
-                # YOLO 모델 형식 그대로 저장
-                yolo_model_path = os.path.join(mlflow.get_artifact_uri(), "yolo_model")
-                os.makedirs(os.path.dirname(yolo_model_path), exist_ok=True)
-                model_save_path = os.path.join(os.path.dirname(yolo_model_path), "best.pt")
-                model.save(model_save_path)
-                mlflow.log_artifact(model_save_path, "yolo_model")
-                
-                print(f"최종 모델이 MLflow 모델 레지스트리에 등록되었습니다: YOLOv11_{args.name}_{args.search_method}")
-        
-        except Exception as e:
-            print(f"학습 중 오류 발생: {e}")
-    
-    print(colorstr('bold', 'green', '모든 과정이 완료되었습니다!'))
 
 def main():
     # 인자 파싱
@@ -510,7 +414,6 @@ def main():
     
     # MLflow 디렉토리 생성
     os.makedirs("optuna_mlruns", exist_ok=True)
-    os.makedirs("final_mlruns", exist_ok=True)
     
     # 내장 VOC 데이터셋을 사용한다고 안내
     print(f"Ultralytics 내장 Pascal VOC 데이터셋을 사용합니다: '{args.data}'")
@@ -521,7 +424,41 @@ def main():
         run_optimization(args)
     else:
         # 최적화 없이 기본 파라미터로 훈련 실행
-        run_final_training(args)
+        # 기존 run_final_training 함수는 제거하고 단일 trial로 optimization 실행
+        print(colorstr('bold', 'green', '최적화 비활성화: 기본 파라미터로 단일 훈련 실행'))
+        data_dict = check_det_dataset(args.data)
+        
+        # 기본 파라미터로 단일 trial 실행
+        class SingleTrial:
+            def __init__(self):
+                self.number = 0
+                
+            def suggest_categorical(self, name, choices):
+                if name == 'batch_size':
+                    return args.batch_size
+                return choices[0]  # 기본값으로 첫 번째 선택지 사용
+                
+            def suggest_float(self, name, low, high, **kwargs):
+                if name == 'lr':
+                    return args.lr
+                elif name == 'momentum':
+                    return 0.937
+                elif name == 'weight_decay':
+                    return 0.0005
+                return low
+                
+            def suggest_int(self, name, low, high):
+                if name == 'warmup_epochs':
+                    return 3
+                return low
+        
+        single_trial = SingleTrial()
+        map_metric, best_model_info = objective(single_trial, args, data_dict)
+        
+        print("\n" + "="*80)
+        print(colorstr('bold', 'green', '단일 훈련 완료!'))
+        print(f"mAP50-95: {map_metric:.4f}")
+        print("="*80 + "\n")
 
 if __name__ == '__main__':
     main()
